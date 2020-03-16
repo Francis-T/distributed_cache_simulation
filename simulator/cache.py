@@ -33,6 +33,9 @@ class Cache():
             return None
         
         return self.contents[k]
+
+    def getKeys(self):
+        return self.content.keys()
     
     def count(self):
         return len(self.contents.keys())
@@ -74,6 +77,7 @@ class CacheIndex(Process):
         # Announce connection to channel
         payload_intro = {
             'type' : 'announce',
+            'class': 'service',
             'id' : self.id, # TODO include other capabilities here too
         }
         self.verbose("Announcement payload: {}".format(json.dumps(payload_intro)))
@@ -86,7 +90,7 @@ class CacheIndex(Process):
         topic = str(msg.topic)
         request = json.loads(msg.payload)
         
-        self.verbose("Received from {}: {}".format(topic, request))
+        # self.verbose("Received from {}: {}".format(topic, request))
         if (request['type'] == 'shutdown') and (topic in self.subs_list):
             self.verbose("Shutting down...")
 

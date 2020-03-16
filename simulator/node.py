@@ -3,6 +3,7 @@ import paho.mqtt.client as mqtt
 import time
 import queue
 import json
+import copy
 
 from simulator.core import QueueManager
 from simulator.util import AttrDict, ShortId
@@ -33,7 +34,7 @@ class AggNodeSimulator(Process):
         return
     
     def log(self, message):
-        print("[{}] {}".format(self.id, message))
+        print("[{} ({})] {}".format(self.id, self.broker_sub, message))
         return
     
     def verbose(self, message):
@@ -60,6 +61,7 @@ class AggNodeSimulator(Process):
                 request = self.queue_info.request.queue.get(block=False, timeout=self.timeout)
             
             except queue.Empty:
+                self.queue_info.request.event.clear()
                 continue
                 
             self.verbose("Request Received: {}".format(request))
@@ -75,6 +77,9 @@ class AggNodeSimulator(Process):
                 
             elif request['type'] == 'task_response':
                 q_id = request['query_id']
+                if q_id in self.active_queries.keys():
+                    self.verbose("Key {} not found".format(q_id))
+                    continue
 
                 # Decrement the task count for this query
                 self.verbose("Task count: {}".format(self.active_queries[q_id]['count']))
@@ -109,7 +114,7 @@ class AggNodeSimulator(Process):
         return
 
 class ProcNodeSimulator(Process):
-    def __init__(self, queue_info, timeout=1, debug_tags="log|debug|verbose"):
+    def __init__(self, queue_info, broker_sub, timeout=1, debug_tags="log|debug|verbose"):
         Process.__init__(self)
         self.id = "PROC-{}".format(ShortId().generate())
         
@@ -122,13 +127,14 @@ class ProcNodeSimulator(Process):
         #    - queue_info.response.event
         
         self.timeout = timeout
+        self.broker_sub = broker_sub
         
         self.debug_tags = debug_tags
         self.verbose("Started.")
         return
     
     def log(self, message):
-        print("[{}] {}".format(self.id, message))
+        print("[{} ({})] {}".format(self.id, self.broker_sub, message))
         return
     
     def verbose(self, message):
@@ -190,79 +196,3 @@ class ProcNodeSimulator(Process):
         self.verbose("Shutdown.")
         return
 
-if __name__ == "__main__":
-    print("""
-    #############################################
-    ### Test Code for ProcNodeSimulator Class ###
-    ###   Change cell type to 'code' when     ###
-    ###               necessary               ###
-    #############################################
-    """)
-
-    qm = QueueManager()
-
-    q, ev = qm.registerQueue('1_req')
-    qi = AttrDict()
-    qi.request = AttrDict()
-    qi.request.queue = q
-    qi.request.event = ev
-
-    q, ev = qm.registerQueue('1_resp')
-    qi.response = AttrDict()
-    qi.response.queue = q
-    qi.response.event = ev
-
-    pns = ProcNodeSimulator(qi)
-    pns.start()
-
-    # test_queue, test_event = qm.registerQueue('test_resp')
-    # Get the response queue
-    resp_queue, resp_ev = qm.getQueueObjs('1_resp')
-
-    q, ev = qm.getQueueObjs('1_req')
-    # Test the status request
-    print("[--] Testing ProcNodeSimulator Status Request")
-    request = {
-        'type' : 'status',
-    }
-    q.put(request)
-    ev.set()
-
-    resp_ev.wait()
-    response = resp_queue.get()
-    print(response)
-    assert 'status' in response.keys()
-    print("[OK] ProcNodeSimulator Status Request")
-
-    # Test the task request
-    print("[--] Testing ProcNodeSimulator Task Request")
-    request = {
-        'type'      : 'task',
-        'query_id'  : ShortId().generate(),
-        'inputs'    : '1+1',
-        'exec_time' : 1.5,
-    }
-    q.put(request)
-    ev.set()
-
-    resp_ev.wait()
-    response = resp_queue.get()
-    print(response)
-    assert 'task_id' in response.keys()
-    print("[OK] ProcNodeSimulator Task Request")
-
-    # Test the shutdown request
-    print("[--] Testing ProcNodeSimulator Shutdown Request")
-    request = {
-        'type' : 'shutdown',
-    }
-    q.put(request)
-    ev.set()
-
-    time.sleep(1.0)
-
-    assert not pns.is_alive()
-    print("[OK] ProcNodeSimulator Shutdown Request")
-
-
-    

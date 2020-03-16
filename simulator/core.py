@@ -81,7 +81,7 @@ class LatencyMap():
 
             x_diff = abs(self.grid.x - other_grid.x)
             y_diff = abs(self.grid.y - other_grid.y)
-            max_latency_value = math.sqrt((x_diff ** 2) + (y_diff ** 2)) * 1.0
+            max_latency_value = math.sqrt((x_diff ** 2) + (y_diff ** 2)) * 2.0
             
             latency_map.append({'x' : other_grid.x,
                                 'y' : other_grid.y,

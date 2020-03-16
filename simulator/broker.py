@@ -3,37 +3,48 @@ import json
 import time
 
 from multiprocessing import Process, Queue, Event, Manager
+from multiprocessing.managers import SyncManager
 
 from simulator.core import *
 from simulator.util import *
 from simulator.cache import CacheIndex, Cache
 from simulator.node import ProcNodeSimulator, AggNodeSimulator
 
+QUERY_COMPLETION_SUB = "query_complete"
+
 class BrokerSimulator(Process):
-    def __init__(self, grid_info, timeout=5, debug_tags="log|debug|verbose"):
+    def __init__(self, grid_info, timeout=5, debug_tags="log|debug|verbose", enable_caching=True):
         Process.__init__(self)
+        self.debug_tags = debug_tags
         self.id = "B-{}".format(ShortId().generate())
         
         # Store the grid info for this broker
         self.grid = grid_info
         
         # Instantiate MQTT client
+        self.verbose("Instantiating MQTT client")
         self.client = mqtt.Client()
         self.client.on_connect = self.onConnectHandler
         self.client.on_message = self.onMessageHandler
 
         # Initialize MQTT variables
+        self.verbose("Initializing MQTT variables")
         self.broker_sub = "broker_{}".format(self.id)
         self.cache_sub = "cache_{}".format(self.id)
         self.subs_list = [ "all", "broker_general", "cache_general", "cache_index",
                            self.broker_sub, self.cache_sub ]
         
         # Instantiate a Manager object for variables that need to be multiprocessed
+        self.verbose("Instantiating Manager object")
         self.broker_manager = Manager()
+        #self.broker_manager.start()
+        #self.broker_manager.start()
+
         self.active_queries = self.broker_manager.dict()
-        self.finished_queries = {}
+        self.finished_queries = self.broker_manager.dict()
 
         # Instantiate Task Queue objects
+        self.verbose("Instantiating Task Queue objects")
         self.tq_info = AttrDict()
         self.tq_info.request = AttrDict()
         self.tq_info.response = AttrDict()
@@ -49,7 +60,7 @@ class BrokerSimulator(Process):
         
         self.timeout = timeout
         self.status  = "INITIALIZED"
-        self.debug_tags = debug_tags
+        self.caching_enabled = enable_caching
 
         self.verbose("Started.")
         return
@@ -58,32 +69,40 @@ class BrokerSimulator(Process):
         self.verbose("Connecting...")
         self.client.connect("localhost", 1883, 60)
         self.client.loop_forever()
+        # self.broker_manager.shutdown()
         self.verbose("Shutdown.")
         return
     
     def onConnectHandler(self, client, userdata, flags, rc):
         self.verbose("Connected.")
         
-        # Start the task processing nodes
-        self.tq_info.request.event.clear()
-        for i in range(0, self.grid.node_count):
-            self.proc_nodes.append(ProcNodeSimulator(self.tq_info))
-            self.proc_nodes[i].start()
+        def launchNodes():
+            self.verbose("Starting processing node/s")
+            # Start the task processing nodes
+            self.tq_info.request.event.clear()
+            for i in range(0, self.grid.node_count):
+                self.proc_nodes.append(ProcNodeSimulator(self.tq_info, self.broker_sub))
+                self.proc_nodes[i].start()
 
-        self.verbose("Processing nodes started.")
+            self.verbose("Processing nodes started.")
 
-        # Start the aggregation node/s
-        self.tq_info.response.event.clear()
-        agq_info = AttrDict()
-        agq_info.request = AttrDict()
-        agq_info.request.queue = self.tq_info.response.queue
-        agq_info.request.event = self.tq_info.response.event
-        self.agg_nodes.append( AggNodeSimulator( agq_info, 
-                                                 self.active_queries, 
-                                                 self.broker_sub) )
-        self.agg_nodes[0].start()
+            # Start the aggregation node/s
+            self.tq_info.response.event.clear()
+            agg_info = AttrDict()
+            agg_info.request = AttrDict()
+            agg_info.request.queue = self.tq_info.response.queue
+            agg_info.request.event = self.tq_info.response.event
+            self.agg_nodes.append( AggNodeSimulator( agg_info, 
+                                                     self.active_queries, 
+                                                     self.broker_sub) )
+            self.verbose("Starting aggregation node/s")
+            self.agg_nodes[0].start()
 
-        self.verbose("Aggregation nodes started.")
+            self.verbose("Aggregation nodes started.")
+            return
+
+        self.verbose("Launching Nodes in a separate process")
+        Process(target=launchNodes).start()
         
         # Subscribe to general MQTT topics and own topics
         client.subscribe([ (sub, 0) for sub in self.subs_list ])
@@ -92,7 +111,9 @@ class BrokerSimulator(Process):
         # Announce connection to channel
         payload_intro = {
             'type' : 'announce',
-            'id' : self.id, # TODO include other capabilities here too
+            'class': 'broker',
+            'id'   : self.id, # TODO include other capabilities here too
+            'grid' : { 'x' : self.grid.x, 'y' : self.grid.y, 'cache_limit' : self.cache.cache_limit, 'latency_map' : self.grid.latency_map.latency_map }
         }
         self.verbose("Announcement payload: {}".format(json.dumps(payload_intro)))
         client.publish("all", json.dumps(payload_intro))
@@ -104,7 +125,7 @@ class BrokerSimulator(Process):
         topic = str(msg.topic)
         request = json.loads(msg.payload)
         
-        self.verbose("Received from {}: {}".format(topic, request))
+        #self.verbose("Received from {}: {}".format(topic, request))
         if (request['type'] == 'shutdown') and (topic in ['all', 'broker_general', self.broker_sub]):
             self.verbose("Shutting down...")
 
@@ -165,6 +186,12 @@ class BrokerSimulator(Process):
             if rc != True:
                 self.debug("Error Occurred during handling of aggregation result!")
                 client.disconnect()
+
+        elif (request['type'] == 'cache_reassign') and (topic in ['all', 'broker_general', self.broker_sub]):
+            rc = self.handleCacheReassign(request, client)
+            if rc != True:
+                self.debug("Error Occurred during handling of cache reassign request!")
+                client.disconnect()
         
         
         return
@@ -181,6 +208,11 @@ class BrokerSimulator(Process):
                                                 'started' : time.time(),
                                                 'ended'   : None, 
                                             })
+
+        if not self.caching_enabled:
+            self.verbose("Caching disabled. Switching over to full processing...")
+            query['query_id'] = query['id']
+            return self.handleQueryProcessing(query, client)
         
         # Check if this query's result can be retrieved from some other cache
         request = {
@@ -273,7 +305,8 @@ class BrokerSimulator(Process):
         #    to retrieve the value of the cached item from it
         
         # Check if this does not have an active query -- if so, disregard it
-        if not query['query_id'] in self.active_queries.keys():
+        q_id = query['query_id']
+        if not q_id in self.active_queries.keys():
             return self.handleQueryProcessing(query, client)
         
 #         [ Expected Broker Response ]
@@ -298,12 +331,43 @@ class BrokerSimulator(Process):
         
         cache_retrieval_delay = self.grid.getLatency(targ_x, targ_y)
         
-        # Simulate the delay with sleep
-        if cache_retrieval_delay > 0.0:
-            time.sleep(cache_retrieval_delay)
-         
-        # Release the cached item
-        self.verbose("Result found after {} secs: {}".format(cache_retrieval_delay, query['result']))
+        def delayed_finish_query():
+            # Simulate the delay with sleep
+            if cache_retrieval_delay > 0.0:
+                time.sleep(cache_retrieval_delay)
+
+            # Reload the ongoing query's information
+            query_info = self.active_queries[q_id]
+             
+            # Add the aggregation result to the finished results
+            self.verbose("Publishing finished result")
+            finished_result = {
+                    'type'    : 'completion_result',
+                    'assigned': { 'x' : targ_x, 'y' : targ_y },
+                    'origin'  : query_info['grid'],
+                    'query_id': q_id,
+                    'inputs'  : query_info['inputs'],
+                    'tasks'   : query_info['tasks'],
+                    'load'    : query_info['load'],
+                    'count'   : query_info['count'], 
+                    'started' : query_info['started'],
+                    'ended'   : time.time(), 
+                    'result'  : query['result'],
+                    'from_cache' : True,
+                    'cache_retrieval_delay' : cache_retrieval_delay,
+            }
+            query_client = mqtt.Client()
+            query_client.connect("localhost", 1883, 60)
+            query_client.publish(QUERY_COMPLETION_SUB, json.dumps(finished_result))
+
+            # Remove query id from active queries
+            del self.active_queries[q_id]
+
+            self.verbose("Result found after {} secs: {}".format(cache_retrieval_delay, query['result']))
+            query_client.disconnect()
+            return
+
+        Process(target=delayed_finish_query).start()
 
         return True
     
@@ -350,16 +414,25 @@ class BrokerSimulator(Process):
             return False
 
         # Add the aggregation result to the finished results
-        self.finished_queries[q_id] = {
+        self.verbose("Publishing finished result")
+        finished_result = {
+                'type'    : 'completion_result',
+                'assigned': { 'x' : self.grid.x, 'y' : self.grid.y },
+                'origin'  : { 'x' : self.grid.x, 'y' : self.grid.y },
+                'query_id': q_id,
                 'inputs'  : query['inputs'],
                 'grid'    : query['grid'],
                 'tasks'   : query['tasks'],
                 'load'    : query['load'],
-                'count'   : query['count'], 
+                'count'   : query['tasks']['processing'], 
                 'started' : query['started'],
                 'ended'   : query['ended'], 
                 'result'  : query['result'],
+                'from_cache' : False,
+                'cache_retrieval_delay' : 0.0,
         }
+
+        client.publish(QUERY_COMPLETION_SUB, json.dumps(finished_result))
 
         # Remove query id from active queries
         del self.active_queries[q_id]
@@ -376,7 +449,17 @@ class BrokerSimulator(Process):
         self.verbose("Sending Cache Index Request: {}".format(request))
         client.publish("cache_index_requests", json.dumps(request))
 
-        self.verbose("Tasks started")
+        return True
+
+    def handleCacheReassign(self, request, client, topic):
+        # TODO
+        nqa_map = request['map']
+
+        # Cycle through each input key in the reassigned query map
+        # for k in self.cache.getKeys():
+        #     # Check if the input key is in our cache, if so 
+        #     cached_item  = self.cache.getItem(k)
+            
 
         return True
     
